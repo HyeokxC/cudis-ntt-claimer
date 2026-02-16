@@ -1,0 +1,21 @@
+{
+  "name": "cudis-ntt-claimer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Monitor Solana custody balance and redeem stuck Wormhole NTT transfer",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.0",
+    "@solana/web3.js": "^1.98.0",
+    "@wormhole-foundation/sdk": "^4.10.0",
+    "@wormhole-foundation/sdk-solana-ntt": "^4.0.13",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
