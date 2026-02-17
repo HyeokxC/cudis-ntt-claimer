@@ -11,6 +11,7 @@ import "@wormhole-foundation/sdk-solana-ntt";
 
 interface Config {
   solanaRpcUrl: string;
+  solanaWsUrl: string;
   solanaPrivateKey: string;
   custodyAddress: string;
   requiredAmountRaw: bigint;
@@ -24,8 +25,7 @@ interface Config {
 }
 
 const CUDIS_DECIMALS = 9;
-const RETRY_BASE_MS = 5_000;
-const RETRY_MAX_MS = 60_000;
+
 type NttAttestation = VAA<"Ntt:WormholeTransfer"> | VAA<"Ntt:WormholeTransferStandardRelayer">;
 
 type LogLevel = "INFO" | "WARN" | "ERROR";
@@ -109,8 +109,12 @@ function loadConfig(): Config {
     throw new Error(`SEQUENCE must be an unsigned integer, got: ${sequenceRaw}`);
   }
 
+  const solanaRpcUrl = requireEnv("SOLANA_RPC_URL");
+  const solanaWsUrl = process.env["SOLANA_WS_URL"]?.trim() || solanaRpcUrl.replace(/^http/, "ws");
+
   return {
-    solanaRpcUrl: requireEnv("SOLANA_RPC_URL"),
+    solanaRpcUrl,
+    solanaWsUrl,
     solanaPrivateKey: requireEnv("SOLANA_PRIVATE_KEY"),
     custodyAddress: requireEnv("CUSTODY_ADDRESS"),
     requiredAmountRaw,
@@ -232,36 +236,35 @@ async function fetchAndRedeem(config: Config, connection: Connection): Promise<s
   return txidStrings;
 }
 
-async function redeemWithRetry(config: Config, connection: Connection): Promise<void> {
-  let attempt = 0;
-  while (true) {
-    attempt += 1;
-    try {
-      log(`Redeem attempt ${attempt}`);
-      await fetchAndRedeem(config, connection);
-      log("Redeem succeeded");
-      return;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      log(`Redeem attempt ${attempt} failed: ${message}`, "ERROR");
+async function tryRedeem(config: Config, connection: Connection): Promise<boolean> {
+  const balance = await getCustodyBalance(connection, config.custodyAddress);
+  const hasEnough = balance.rawAmount >= config.requiredAmountRaw;
+  log(`Custody balance: ${balance.uiAmountString} CUDIS | sufficient=${hasEnough}`);
 
-      const delay = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_MS);
-      log(`Waiting ${delay}ms before next retry`, "WARN");
-      await sleep(delay);
-    }
+  if (!hasEnough) {
+    return false;
   }
+
+  log("Balance threshold reached; attempting redeem");
+  await fetchAndRedeem(config, connection);
+  log("Claim completed successfully; exiting");
+  return true;
 }
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  const connection = new Connection(config.solanaRpcUrl, "confirmed");
+  const connection = new Connection(config.solanaRpcUrl, {
+    commitment: "confirmed",
+    wsEndpoint: config.solanaWsUrl,
+  });
 
   await validateCustodyTokenAccount(connection, config.custodyAddress, config.tokenMint);
 
-  log("Starting CUDIS NTT claimer");
+  log("Starting CUDIS NTT claimer (websocket mode)");
   log(`Custody account: ${config.custodyAddress}`);
   log(`Required amount: ${config.requiredAmountDisplay} CUDIS`);
-  log(`Poll interval: ${config.pollIntervalMs}ms`);
+  log(`WebSocket endpoint: ${config.solanaWsUrl}`);
+  log(`Fallback poll interval: ${config.pollIntervalMs}ms`);
 
   let running = true;
   const handleShutdown = (signal: NodeJS.Signals): void => {
@@ -269,38 +272,48 @@ async function main(): Promise<void> {
       return;
     }
     running = false;
-    log(`Received ${signal}, shutting down after current cycle`);
+    log(`Received ${signal}, shutting down`);
   };
 
   process.on("SIGINT", handleShutdown);
   process.on("SIGTERM", handleShutdown);
 
-  while (running) {
+  let redeemInProgress = false;
+  const custodyPubkey = new PublicKey(config.custodyAddress);
+
+  const handleBalanceChange = async (source: string): Promise<void> => {
+    if (redeemInProgress || !running) return;
+    redeemInProgress = true;
     try {
-      const balance = await getCustodyBalance(connection, config.custodyAddress);
-      const hasEnough = balance.rawAmount >= config.requiredAmountRaw;
-      log(
-        `Custody balance: ${balance.uiAmountString} CUDIS (raw=${balance.rawAmount.toString()}) | threshold raw=${config.requiredAmountRaw.toString()} | sufficient=${hasEnough}`,
-      );
-
-      if (hasEnough) {
-        log("Balance threshold reached; beginning redeem sequence");
-        await redeemWithRetry(config, connection);
-        log("Claim completed successfully; exiting");
-        process.exit(0);
-      }
+      const claimed = await tryRedeem(config, connection);
+      if (claimed) process.exit(0);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      log(`Polling cycle error: ${message}`, "ERROR");
+      const msg = error instanceof Error ? error.message : String(error);
+      log(`Redeem failed (${source}): ${msg}`, "ERROR");
+    } finally {
+      redeemInProgress = false;
     }
+  };
 
-    if (!running) {
-      break;
-    }
+  const subscriptionId = connection.onAccountChange(
+    custodyPubkey,
+    () => {
+      log("WebSocket: custody account changed");
+      void handleBalanceChange("ws");
+    },
+    "confirmed",
+  );
+  log(`WebSocket subscription active (id=${subscriptionId})`);
 
+  void handleBalanceChange("initial");
+
+  while (running) {
     await sleep(config.pollIntervalMs);
+    if (!running) break;
+    await handleBalanceChange("poll");
   }
 
+  await connection.removeAccountChangeListener(subscriptionId);
   log("Exited without claiming due to shutdown signal");
 }
 
