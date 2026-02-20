@@ -25,6 +25,7 @@ interface Config {
 }
 
 const CUDIS_DECIMALS = 9;
+const CUDIS_DIVISOR = 10n ** BigInt(CUDIS_DECIMALS);
 
 type NttAttestation = VAA<"Ntt:WormholeTransfer"> | VAA<"Ntt:WormholeTransferStandardRelayer">;
 
@@ -89,6 +90,18 @@ function decimalToRawAmount(value: string, decimals: number): bigint {
   const paddedFraction = fractionalPart.padEnd(decimals, "0");
   const normalized = `${wholePart}${paddedFraction}`.replace(/^0+/, "") || "0";
   return BigInt(normalized);
+}
+
+function formatRawAmount(raw: bigint): string {
+  const whole = raw / CUDIS_DIVISOR;
+  const frac = raw % CUDIS_DIVISOR;
+  if (frac === 0n) return whole.toString();
+  const fracStr = frac.toString().padStart(CUDIS_DECIMALS, "0").replace(/0+$/, "");
+  return `${whole}.${fracStr}`;
+}
+
+function parseTokenAmountFromAccountData(data: Buffer): bigint {
+  return data.readBigUInt64LE(64);
 }
 
 function normalizeEmitterAddressForSdk(emitterHex32: string): string {
@@ -236,8 +249,9 @@ async function fetchAndRedeem(config: Config, connection: Connection): Promise<s
   return txidStrings;
 }
 
-async function tryRedeem(config: Config, connection: Connection): Promise<boolean> {
+async function tryRedeem(config: Config, connection: Connection, updateBalance: (raw: bigint) => void): Promise<boolean> {
   const balance = await getCustodyBalance(connection, config.custodyAddress);
+  updateBalance(balance.rawAmount);
   const hasEnough = balance.rawAmount >= config.requiredAmountRaw;
   log(`Custody balance: ${balance.uiAmountString} CUDIS | sufficient=${hasEnough}`);
 
@@ -279,13 +293,14 @@ async function main(): Promise<void> {
   process.on("SIGTERM", handleShutdown);
 
   let redeemInProgress = false;
+  let lastKnownRawBalance = 0n;
   const custodyPubkey = new PublicKey(config.custodyAddress);
 
   const handleBalanceChange = async (source: string): Promise<void> => {
     if (redeemInProgress || !running) return;
     redeemInProgress = true;
     try {
-      const claimed = await tryRedeem(config, connection);
+      const claimed = await tryRedeem(config, connection, (raw) => { lastKnownRawBalance = raw; });
       if (claimed) process.exit(0);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -297,8 +312,12 @@ async function main(): Promise<void> {
 
   const subscriptionId = connection.onAccountChange(
     custodyPubkey,
-    () => {
-      log("WebSocket: custody account changed");
+    (accountInfo) => {
+      const newRaw = parseTokenAmountFromAccountData(accountInfo.data as Buffer);
+      const delta = newRaw - lastKnownRawBalance;
+      const sign = delta >= 0n ? "+" : "";
+      log(`WebSocket: custody account changed | ${formatRawAmount(lastKnownRawBalance)} → ${formatRawAmount(newRaw)} CUDIS (${sign}${formatRawAmount(delta)})`);
+      lastKnownRawBalance = newRaw;
       void handleBalanceChange("ws");
     },
     "confirmed",
